@@ -1,7 +1,3 @@
-#pragma SPARK_NO_PREPROCESSOR
-#include "WifiScan.h"
-#undef min
-#undef max
 #include <vector>
 #include <algorithm>
 #include "hw_config.h"
@@ -24,10 +20,11 @@ int buttonChange = 0;               // incremented on rising signal edge from th
 int motionChange = 0;               // incremented on rising signal edge from the motion sensor
 
 int openNetworkCount = 0;           // the current number of known open networks yet to be vanquished!
-WifiScanResults_t strongest;   // the current strongest network that's not been seen before
+WiFiAccessPoint strongest;   // the current strongest network that's not been seen before
 std::vector<String> seen;      // SSIDs of networks we've seen before, so they can be hopped over
 std::vector<String> scanned;   // The raw list of SSIDs from this scan (includes already seen networks)
 // This is used to know when the scan has "looped" around when the SSID has already been scanned previously
+bool scanning = false;
 
 void buttonToggle() {           // interrupt function when button line rises
     buttonChange++;
@@ -69,19 +66,6 @@ void setup() {
 }
 
 /**
- * Fetch the SSID as a string from the scan result. The SSID is not null terminated
- * in the result, and so is not readily usable as a string.
- * @param result  The scan result to fetch the SSID of.
- * @return The SSID as a String
- */
-String ssid(WifiScanResults_t& result) {
-    char buf[33];
-    memcpy(buf, result.ssid, 32);
-    buf[result.ssidlen] = 0;
-    return buf;
-}
-
-/**
  * Determines if a vector contains a string.
  * @param v     The vector to check
  * @param value The value to look for
@@ -94,15 +78,15 @@ bool contains(std::vector<String>& v, String& value) {
 /**
  * Determines if this network has been seen before.
  */
-bool is_seen(WifiScanResults_t& result) {
-    String name = ssid(result);
+bool is_seen(WiFiAccessPoint& result) {
+    String name = result.ssid;
     return contains(seen, name);
 }
 
 /**
  * Determines if this network is open/unsecured.
  */
-bool is_open(WifiScanResults_t& result) {
+bool is_open(WiFiAccessPoint& result) {
     return result.security==0; 
 }
 
@@ -114,8 +98,8 @@ void togglePin(int pin) {
  * Determines if a new candidate network has a stringer RSSI than the current
  * strongest network.
  */
-bool is_stronger(WifiScanResults_t& candidate, WifiScanResults_t& strongest) {
-    return strongest.rssi == 0 || (candidate.rssi < strongest.rssi);
+bool is_stronger(WiFiAccessPoint& candidate, WiFiAccessPoint& strongest) {
+    return (candidate.rssi < 0) && (candidate.rssi > strongest.rssi);
 }
 
 void soundfx() {
@@ -136,7 +120,7 @@ void setLight(int b)
 }
 
 int lastUpdate = 0;     // the time in millis the sword status was last updated
-void updateStatus(int openCount, WifiScanResults_t& strongest) 
+void updateStatus(int openCount, WiFiAccessPoint& strongest) 
 {    
     setLight(0);
     delay(400);
@@ -171,12 +155,12 @@ bool is_scanned(String& name) {
  */
 bool waitForCloud(bool state, unsigned timeout) {
     unsigned start = millis();
-    while (Spark.connected()!=state && (millis()-start)<timeout) {
-        SPARK_WLAN_Loop();
+    while (Particle.connected()!=state && (millis()-start)<timeout) {
+        Particle.process();
         delay(100);
         soundfx();
     }
-    return Spark.connected()==state;
+    return Particle.connected()==state;
 }
 
 /**
@@ -198,7 +182,7 @@ bool waitForWifi(unsigned timeout) {
     unsigned start = millis();
     while (!WiFi.ready() && (millis()-start)<timeout) {
         makeSound();
-        SPARK_WLAN_Loop();
+        Particle.process();
         delay(1000);
     }
     return WiFi.ready();
@@ -214,16 +198,16 @@ void vanquishOpenNetwork() {
         return;
     RGB.control(false);     // allow the system to control the LED so we can see cloud connection progress
     makeSound();
-    String name = ssid(strongest);
+    String name = strongest.ssid;
     WiFi.on();
     WiFi.setCredentials(name.c_str());
     makeSound();
     WiFi.connect();
     if (waitForWifi(20000)) {    // wait for the DHCP to complete
-        Spark.connect();         // start connecting to the cloud
+        Particle.connect();         // start connecting to the cloud
         if (waitForCloud(true, 30000))  // wait for connection
         {
-            Spark.publish("vanquished",name);  // Feel the Wrath!            
+            Particle.publish("vanquished",name);  // Feel the Wrath!            
             makeSound();
 
             for (int i=0; i<50; i++) {         // flash the LED faster and faster
@@ -238,7 +222,7 @@ void vanquishOpenNetwork() {
             openNetworkCount--;                // one less unsecured network!
             seen.push_back(name);              // remember that we've dealt with this one
             strongest.rssi = 0;
-            Spark.disconnect();
+            Particle.disconnect();
             WiFi.disconnect();
         }
     }
@@ -252,31 +236,41 @@ bool start_scan = true;                 // when set to true, scan() will start a
  */
 void scan() {
     static bool scanning = false;
-    static WifiScan scanner;    
     if (!scanning && start_scan) {
         memset(&strongest, 0, sizeof(strongest));
         openNetworkCount = 0;
         scanning = true;
         start_scan = false;
         scanned.clear();
-        scanner.startScan();
+        // scanner.startScan();
+        WiFi.scan(handle_ap, void);
     }
-    else if (scanning) {
-        WifiScanResults_t result;
-        scanning = scanner.next(result);
-        String name = ssid(result);        
-        if (scanning && name.length() && is_scanned(name)) {
-            // already seen this name, so stop scanning
-            scanning = false;
-            updateStatus(openNetworkCount, strongest);
+}
+
+void handle_ap(WiFiAccessPoint* wap)
+{
+    next(*wap);
+}
+
+void next(WiFiAccessPoint& result)
+{
+    String name = result.ssid;        
+    if (name.length() && is_scanned(name)) {
+        // already seen this name, so stop scanning
+        updateStatus(openNetworkCount, strongest);
+        scanning = false;
+    }
+    if (is_open(result) && !is_seen(result)) {  
+        // a new open network
+        openNetworkCount++;
+        if (is_stronger(result,strongest)) {
+            memcpy(&strongest, &result, sizeof(result));
         }
-        if (scanning && is_open(result) && !is_seen(result)) {  
-            // a new open network
-            openNetworkCount++;
-            if (is_stronger(result,strongest)) {
-                memcpy(&strongest, &result, sizeof(result));
-            }
-        }
+    }
+
+    if ((result.rssi < 0) && (result.rssi > strongest.rssi)) {
+        strongest = result;
+        // strcpy(strongest_ssid, ap.ssid);
     }
 }
 
